@@ -125,7 +125,13 @@ jobs:
         sed -i -E '/^CONFIG_VERSION_NUMBER=/d; /^CONFIG_VERSION_REPO=/d' .config
         echo "CONFIG_VERSION_NUMBER=\"${EXPECTED_RELEASE}\"" >> .config
         echo "CONFIG_VERSION_REPO=\"https://downloads.immortalwrt.org/releases/${EXPECTED_RELEASE}\"" >> .config
-        
+
+        # 追加"无线 + 单设备单IP + SK5"功能包（后写覆盖 full.config 中的 is not set）
+        if [ -f "$GITHUB_WORKSPACE/configs/sk5-wireless.config" ]; then
+          echo "--> 追加无线 / 单设备单 IP / SK5 功能包..."
+          cat "$GITHUB_WORKSPACE/configs/sk5-wireless.config" >> .config
+        fi
+
         make defconfig
         if ! grep -q '^CONFIG_TARGET_x86_64=y' .config; then
           echo "[ERROR] 配置非 x86_64 目标架构！" >&2

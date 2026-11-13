@@ -104,6 +104,37 @@ if [ -d "$GITHUB_WORKSPACE/files" ]; then
   cp -r "$GITHUB_WORKSPACE/files/"* files/ 2>/dev/null || true
 fi
 
+# 7.1 集成 SK5 出口内核 mihomo（固定版本 + SHA256 校验；x86_64 专用）
+MIHOMO_VERSION="v1.19.34"
+MIHOMO_SHA256="2763f5b414527f7baf6dc57e3f82f3ab561eedf34bfd7c2f2cde1f7e592efe06"
+if [ ! -x files/usr/bin/mihomo ]; then
+  echo "=================================================="
+  echo "--> 正在下载 mihomo ${MIHOMO_VERSION} (SK5 出口内核)..."
+  echo "=================================================="
+  mkdir -p files/usr/bin
+  MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-compatible-${MIHOMO_VERSION}.gz"
+  rm -f /tmp/mihomo.gz
+  for attempt in 1 2 3; do
+    if curl -fL --retry 2 --connect-timeout 20 -m 600 -o /tmp/mihomo.gz "$MIHOMO_URL"; then
+      break
+    fi
+    echo "[WARN] mihomo 第 ${attempt} 次下载失败，5 秒后重试..."
+    sleep 5
+  done
+  echo "${MIHOMO_SHA256}  /tmp/mihomo.gz" | sha256sum -c - || {
+    echo "[ERROR] mihomo 校验失败，终止编译。" >&2
+    exit 1
+  }
+  gunzip -c /tmp/mihomo.gz > files/usr/bin/mihomo
+  chmod 0755 files/usr/bin/mihomo
+  rm -f /tmp/mihomo.gz
+  ls -lh files/usr/bin/mihomo
+fi
+
+# 7.2 修正关键脚本的可执行位（Windows 下检出的仓库可能丢失 755）
+chmod 0755 files/usr/sbin/sk5ctl files/etc/init.d/sk5 \
+           files/etc/uci-defaults/95-sk5-defaults files/etc/uci-defaults/97-wireless-ap 2>/dev/null || true
+
 # 8. 动态从 feeds 提取原版 luci-mod-system.json，剔除 plugins 并写入 files/ 覆盖层
 orig_mod_json=$(find feeds/ -type f -path "*/luci-mod-system/root/usr/share/luci/menu.d/luci-mod-system.json" 2>/dev/null | head -n 1)
 if [ -n "$orig_mod_json" ] && [ -f "$orig_mod_json" ]; then

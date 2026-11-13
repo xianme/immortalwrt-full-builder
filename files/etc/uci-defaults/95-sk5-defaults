@@ -1,0 +1,6 @@
+#!/bin/sh
+# 首次开机：生成 WiFi 密码、划分静态地址段、按需关闭 IPv6 下发
+# 具体逻辑在 /usr/sbin/sk5ctl defaults，保证首次开机与后期手工执行一致。
+[ -x /usr/sbin/sk5ctl ] || exit 0
+/usr/sbin/sk5ctl defaults
+exit 0

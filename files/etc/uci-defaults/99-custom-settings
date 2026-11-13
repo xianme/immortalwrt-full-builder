@@ -43,7 +43,18 @@ if [ "$ETH_COUNT" -ge 2 ]; then
     uci -q delete network.wan6
 else
     # 单网口物理机保底：强制为 LAN，避免断网变砖
-    uci set network.lan.device='eth0'
+    if [ -d /sys/class/ieee80211 ]; then
+        # 有无线网卡时保留网桥，让 wlan AP 与唯一网口同桥 (sk5 单设备单 IP 需要)
+        FIRST_DEV=$(echo "$ETH_DEVS" | head -n 1)
+        uci set network.br_lan=device
+        uci set network.br_lan.name='br-lan'
+        uci set network.br_lan.type='bridge'
+        uci -q delete network.br_lan.ports
+        uci add_list network.br_lan.ports="$FIRST_DEV"
+        uci set network.lan.device='br-lan'
+    else
+        uci set network.lan.device='eth0'
+    fi
     uci -q delete network.wan
     uci -q delete network.wan6
 fi

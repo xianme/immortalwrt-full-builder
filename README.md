@@ -16,7 +16,28 @@
 - **防火墙**：100% 现代 Firewall4 (fw4) + Nftables + 双向 FullCone NAT1
 - **远程互联**：原生 Linux 内核态 WireGuard (kmod-wireguard)，全速线速转发，与透明代理秋毫无犯
 - **存储扩展**：集成 FUSE 3 全栈 (`kmod-fuse`, `libfuse3`, `fuse3-utils`)，Docker 容器联动秒变轻 NAS
+- **无线 AP**：内置 `wpad-basic-mbedtls` 与 Intel AX/BE、MTK、Atheros、Realtek 常见 x86 无线网卡驱动，首次开机自动建 AP 并桥接进 `br-lan`
+- **单设备单 IP**：设备登记后独占 `LAN.10 - LAN.99` 的固定地址（dnsmasq 静态租约），可选 MAC/IP 强制绑定
+- **一机一 SK5**：每台设备按源 IP 分流到自己独立的 SK5(SOCKS5) 出口，nftables TPROXY 透明接管，设备零配置
 - **开机自愈**：`99-custom-settings` 自动识别物理网口、单网桥清理、自动创建 br-lan、TTYD 终端免密登录
+
+---
+
+## 📶 无线 + 单设备单 IP + SK5 出口
+
+固件已内置「无线 AP + 一机一 IP + 每设备独立 SK5 出口」，刷机后只需几条命令：
+
+```sh
+sk5ctl status                       # 查看 WiFi 名称/密码、LAN、端口
+sk5ctl add 手机01 socks5://user:pass@1.2.3.4:1080 AA:BB:CC:DD:EE:01
+sk5ctl list
+```
+
+- 每台设备固定一个内网 IP（dnsmasq 静态租约，动态池从 `.100` 起，互不冲突）
+- 按源 IP 用 mihomo `SRC-IP-CIDR` 分流，设备不用任何代理设置
+- nftables TPROXY 同时接管 TCP/UDP；可选 MAC/IP 强制绑定、关闭 IPv6 下发
+
+完整说明见 [`docs/sk5-wireless.md`](docs/sk5-wireless.md)。
 
 ---
 

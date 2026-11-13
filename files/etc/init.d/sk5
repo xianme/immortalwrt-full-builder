@@ -1,0 +1,42 @@
+#!/bin/sh /etc/rc.common
+# ==============================================================================
+# SK5 出口服务: 生成 mihomo 配置 -> 启动 mihomo -> 挂 TPROXY 规则
+# 只有在至少一台设备绑定了 SK5 时才会真正启动，否则保持空转。
+# ==============================================================================
+
+START=95
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	[ "$(uci -q get sk5.main.enabled)" = "0" ] && return 0
+	[ -x /usr/bin/mihomo ] || return 0
+	[ -x /usr/sbin/sk5ctl ] || return 0
+
+	# 用 UCI 里的设备表重新生成配置（设备改了但没执行 apply 时也能自愈）
+	/usr/sbin/sk5ctl generate >/dev/null 2>&1
+
+	_count=$(/usr/sbin/sk5ctl count 2>/dev/null)
+	case "$_count" in ''|*[!0-9]*) _count=0 ;; esac
+	[ "$_count" -gt 0 ] || return 0
+
+	procd_open_instance
+	procd_set_param command /usr/bin/mihomo -d /etc/mihomo
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+
+	/usr/sbin/sk5ctl tproxy up >/dev/null 2>&1
+	return 0
+}
+
+stop_service() {
+	/usr/sbin/sk5ctl tproxy down >/dev/null 2>&1
+	return 0
+}
+
+reload_service() {
+	stop_service
+	start_service
+}

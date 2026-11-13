@@ -1,0 +1,6 @@
+#!/bin/sh
+# 首次开机：为检测到的无线网卡生成 AP（桥接进 lan），SSID/密码取自 /etc/config/sk5
+# 若开机时没有无线网卡，插卡后执行 sk5ctl ap 即可补配。
+[ -x /usr/sbin/sk5ctl ] || exit 0
+/usr/sbin/sk5ctl ap
+exit 0

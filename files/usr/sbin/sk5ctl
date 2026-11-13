@@ -1,0 +1,717 @@
+#!/bin/sh
+# ==============================================================================
+# sk5ctl - 无线 AP / 单设备单 IP / 每设备独立 SK5(SOCKS5) 出口 管理工具
+#
+# 设计:
+#   1. 每台设备在 /etc/config/sk5 里登记为一条 device，绑定 固定内网 IP + 一条 SK5；
+#   2. 固定 IP 通过 dnsmasq 静态租约下发，设备每次上线都拿到同一个地址；
+#   3. nftables 把 br-lan 上客户端的 TCP/UDP 流量 TPROXY 到 mihomo，
+#      mihomo 用 SRC-IP-CIDR 规则把不同源 IP 分流到各自的 SK5 出口 —— 一机一 IP；
+#   4. 可选 MAC/IP 强制绑定，设备私改 IP 会被丢弃，无法绕过出口策略。
+#
+# 常用:
+#   sk5ctl add 手机01 socks5://user:pass@1.2.3.4:1080 AA:BB:CC:DD:EE:01
+#   sk5ctl list
+#   sk5ctl set 手机01 proxy socks5://user:pass@5.6.7.8:1080
+#   sk5ctl del 手机01
+#   sk5ctl apply
+#   sk5ctl status
+# ==============================================================================
+
+SK5_CONF="sk5"
+SK5_DIR="/etc/sk5"
+MIHOMO_DIR="/etc/mihomo"
+MIHOMO_CONF="$MIHOMO_DIR/config.yaml"
+NFT_FILE="$SK5_DIR/tproxy.nft"
+
+log() { printf '%s\n' "$*" >&2; }
+die() { log "错误: $*"; exit 1; }
+
+uci_get() { uci -q get "$1" 2>/dev/null; }
+
+main_opt() {
+	_v=$(uci_get "$SK5_CONF.main.$1")
+	[ -n "$_v" ] || _v="$2"
+	printf '%s' "$_v"
+}
+
+wifi_opt() {
+	_v=$(uci_get "$SK5_CONF.wifi.$1")
+	[ -n "$_v" ] || _v="$2"
+	printf '%s' "$_v"
+}
+
+device_sections() {
+	uci -q show "$SK5_CONF" 2>/dev/null | sed -n "s/^$SK5_CONF\.\([^.=]*\)=device$/\1/p"
+}
+
+find_section() {
+	for _ds in $(device_sections); do
+		if [ "$(uci_get "$SK5_CONF.$_ds.name")" = "$1" ]; then
+			printf '%s' "$_ds"
+			return 0
+		fi
+	done
+	return 1
+}
+
+count_enabled_proxies() {
+	_cn=0
+	for _cs in $(device_sections); do
+		[ "$(uci_get "$SK5_CONF.$_cs.enabled")" = "0" ] && continue
+		[ -n "$(uci_get "$SK5_CONF.$_cs.proxy")" ] || continue
+		_cn=$((_cn + 1))
+	done
+	printf '%s' "$_cn"
+}
+
+gen_key() {
+	head -c 64 /dev/urandom 2>/dev/null | md5sum | cut -c1-12
+}
+
+# ------------------------------------------------------------------------------
+# 代理地址解析: 支持
+#   socks5://user:pass@host:port
+#   socks5h://user:pass@host:port
+#   host:port
+#   host:port:user:pass
+# 解析结果放在 P_HOST / P_PORT / P_USER / P_PASS
+# ------------------------------------------------------------------------------
+parse_proxy_raw() {
+	_url="$1"
+	P_HOST=''; P_PORT=''; P_USER=''; P_PASS=''
+
+	case "$_url" in
+		socks5://*|socks5h://*|socks://*) _url="${_url#*://}" ;;
+	esac
+
+	case "$_url" in
+		*@*)
+			_creds="${_url%@*}"
+			_url="${_url##*@}"
+			case "$_creds" in
+				*:*) P_USER="${_creds%%:*}"; P_PASS="${_creds#*:}" ;;
+				*)   P_USER="$_creds" ;;
+			esac
+			;;
+	esac
+
+	case "$_url" in
+		*:*:*:*)
+			P_HOST="${_url%%:*}"
+			_rest="${_url#*:}"
+			P_PORT="${_rest%%:*}"
+			_rest="${_rest#*:}"
+			P_USER="${_rest%%:*}"
+			P_PASS="${_rest#*:}"
+			;;
+		*:*)
+			P_HOST="${_url%%:*}"
+			P_PORT="${_url#*:}"
+			;;
+		*)
+			return 1
+			;;
+	esac
+
+	[ -n "$P_HOST" ] || return 1
+	case "$P_PORT" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$P_PORT" -ge 1 ] && [ "$P_PORT" -le 65535 ] || return 1
+	return 0
+}
+
+parse_proxy() {
+	parse_proxy_raw "$1" || die "代理地址格式不正确: $1 (示例 socks5://user:pass@1.2.3.4:1080)"
+}
+
+normalize_mac() {
+	_c=$(printf '%s' "$1" | tr -d ':-' | tr 'a-f' 'A-F')
+	[ ${#_c} -eq 12 ] || die "MAC 地址格式不正确: $1"
+	case "$_c" in *[!0-9A-F]*) die "MAC 地址格式不正确: $1" ;; esac
+	printf '%s' "$_c" | sed 's/../&:/g; s/:$//'
+}
+
+validate_ip() {
+	printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || die "IP 地址不合法: $1"
+	_IFS="$IFS"; IFS=.
+	for _o in $1; do
+		[ "$_o" -le 255 ] || die "IP 地址不合法: $1"
+	done
+	IFS="$_IFS"
+}
+
+validate_name() {
+	case "$1" in
+		''|*[[:space:]]*|*,*|*\|*)
+			die "设备名称不能为空，且不能包含空格、逗号或竖线: $1"
+			;;
+	esac
+	[ ${#1} -le 32 ] || die "设备名称过长（最多 32 字符）: $1"
+}
+
+check_ip_free() {
+	for _is in $(device_sections); do
+		[ -n "$2" ] && [ "$_is" = "$2" ] && continue
+		if [ "$(uci_get "$SK5_CONF.$_is.ip")" = "$1" ]; then
+			die "IP $1 已被设备 $(uci_get "$SK5_CONF.$_is.name") 占用"
+		fi
+	done
+	for _hs in $(uci -q show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^.=]*\)=host$/\1/p'); do
+		if [ "$(uci_get "dhcp.$_hs.ip")" = "$1" ]; then
+			die "IP $1 已被 dnsmasq 静态租约 $_hs 占用"
+		fi
+	done
+}
+
+check_mac_free() {
+	for _ms in $(device_sections); do
+		[ -n "$2" ] && [ "$_ms" = "$2" ] && continue
+		if [ "$(uci_get "$SK5_CONF.$_ms.mac")" = "$1" ]; then
+			die "MAC $1 已绑定设备 $(uci_get "$SK5_CONF.$_ms.name")"
+		fi
+	done
+}
+
+# 从 LAN 网段的 .10 - .99 里挑一个未占用的地址（动态池固定从 .100 起）
+alloc_ip() {
+	_lan=$(uci_get network.lan.ipaddr)
+	[ -n "$_lan" ] || _lan="192.168.1.1"
+	case "$_lan" in
+		*.*.*.*) ;;
+		*) die "无法识别 LAN 地址: $_lan" ;;
+	esac
+	_prefix="${_lan%.*}"
+	_lanhost="${_lan##*.}"
+
+	_h=10
+	while [ "$_h" -le 99 ]; do
+		if [ "$_h" -ne "$_lanhost" ]; then
+			_cand="$_prefix.$_h"
+			_used=0
+			for _as in $(device_sections); do
+				if [ "$(uci_get "$SK5_CONF.$_as.ip")" = "$_cand" ]; then
+					_used=1
+					break
+				fi
+			done
+			if [ "$_used" -eq 0 ]; then
+				for _dh in $(uci -q show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^.=]*\)=host$/\1/p'); do
+					if [ "$(uci_get "dhcp.$_dh.ip")" = "$_cand" ]; then
+						_used=1
+						break
+					fi
+				done
+			fi
+			if [ "$_used" -eq 0 ]; then
+				printf '%s' "$_cand"
+				return 0
+			fi
+		fi
+		_h=$((_h + 1))
+	done
+	return 1
+}
+
+yaml_q() {
+	printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+# ------------------------------------------------------------------------------
+# 生成 mihomo 配置: 每个启用设备一条 socks5 出站 + 一条 SRC-IP-CIDR 规则
+# ------------------------------------------------------------------------------
+gen_config() {
+	mkdir -p "$MIHOMO_DIR"
+	_tmp="$MIHOMO_CONF.tmp"
+
+	{
+		printf '# 由 sk5ctl 自动生成，请勿手工编辑；改配置请用 sk5ctl 或 uci + sk5ctl apply\n'
+		printf 'mixed-port: %s\n' "$(main_opt mixed_port 7890)"
+		printf 'allow-lan: true\n'
+		printf "bind-address: '*'\n"
+		printf 'mode: rule\n'
+		printf 'log-level: %s\n' "$(main_opt log_level warning)"
+		printf 'ipv6: false\n'
+		printf 'external-controller: 127.0.0.1:%s\n' "$(main_opt api_port 9090)"
+		printf 'tproxy-port: %s\n' "$(main_opt tproxy_port 7895)"
+		printf 'unified-delay: true\n'
+		printf 'tcp-concurrent: true\n'
+		printf 'sniffer:\n'
+		printf '  enable: true\n'
+		printf '  force-dns-mapping: true\n'
+		printf '  parse-pure-ip: true\n'
+		printf '  override-destination: true\n'
+		printf '  sniff:\n'
+		printf '    HTTP:\n'
+		printf '      ports: [80, 8080-8880]\n'
+		printf '      override-destination: true\n'
+		printf '    TLS:\n'
+		printf '      ports: [443, 8443]\n'
+		printf '    QUIC:\n'
+		printf '      ports: [443, 8443]\n'
+	} > "$_tmp"
+
+	_ptmp="$MIHOMO_DIR/.proxies.tmp"
+	_rtmp="$MIHOMO_DIR/.rules.tmp"
+	: > "$_ptmp"
+	: > "$_rtmp"
+
+	for _ps in $(device_sections); do
+		[ "$(uci_get "$SK5_CONF.$_ps.enabled")" = "0" ] && continue
+		_purl=$(uci_get "$SK5_CONF.$_ps.proxy")
+		[ -n "$_purl" ] || continue
+		parse_proxy_raw "$_purl" || continue
+		_pname=$(uci_get "$SK5_CONF.$_ps.name")
+		_pip=$(uci_get "$SK5_CONF.$_ps.ip")
+		{
+			printf '  - name: %s\n' "$(yaml_q "$_pname")"
+			printf '    type: socks5\n'
+			printf '    server: %s\n' "$(yaml_q "$P_HOST")"
+			printf '    port: %s\n' "$P_PORT"
+			[ -n "$P_USER" ] && printf '    username: %s\n' "$(yaml_q "$P_USER")"
+			[ -n "$P_PASS" ] && printf '    password: %s\n' "$(yaml_q "$P_PASS")"
+			printf '    udp: true\n'
+		} >> "$_ptmp"
+		[ -n "$_pip" ] && printf '  - SRC-IP-CIDR,%s/32,%s\n' "$_pip" "$_pname" >> "$_rtmp"
+	done
+
+	if [ -s "$_ptmp" ]; then
+		printf 'proxies:\n' >> "$_tmp"
+		cat "$_ptmp" >> "$_tmp"
+	else
+		printf 'proxies: []\n' >> "$_tmp"
+	fi
+
+	printf 'rules:\n' >> "$_tmp"
+	cat "$_rtmp" >> "$_tmp"
+	if [ "$(main_opt default_action direct)" = "block" ]; then
+		printf '  - MATCH,REJECT\n' >> "$_tmp"
+	else
+		printf '  - MATCH,DIRECT\n' >> "$_tmp"
+	fi
+
+	rm -f "$_ptmp" "$_rtmp"
+	mv -f "$_tmp" "$MIHOMO_CONF"
+	chmod 0600 "$MIHOMO_CONF"
+}
+
+# ------------------------------------------------------------------------------
+# 生成 nftables TPROXY 规则
+#   只接管 br-lan 进来的流量；回环 / 内网 / 代理服务器地址 / 已标记流量一律放行，
+#   防止把发往 SK5 服务器自身的连接再次代理造成回环。
+# ------------------------------------------------------------------------------
+resolve_host() {
+	case "$1" in
+		*[!0-9.]*)
+			timeout 5 nslookup "$1" 2>/dev/null | sed -n 's/^Address: *\([0-9][0-9.]*\)$/\1/p'
+			;;
+		*)
+			printf '%s\n' "$1"
+			;;
+	esac
+}
+
+bypass_ips() {
+	for _bs in $(device_sections); do
+		[ "$(uci_get "$SK5_CONF.$_bs.enabled")" = "0" ] && continue
+		_burl=$(uci_get "$SK5_CONF.$_bs.proxy")
+		[ -n "$_burl" ] || continue
+		parse_proxy_raw "$_burl" || continue
+		resolve_host "$P_HOST"
+	done | sort -u
+}
+
+gen_nft() {
+	mkdir -p "$SK5_DIR"
+	_tproxy=$(main_opt tproxy_port 7895)
+	# 入口接口: 优先取 sk5.main.lan_if，未配置则自动取 network.lan.device
+	_lanif=$(main_opt lan_if "")
+	[ -n "$_lanif" ] || _lanif=$(uci_get network.lan.device)
+	[ -n "$_lanif" ] || _lanif="br-lan"
+	_elements="0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255"
+	_extra=""
+	for _bip in $(bypass_ips); do
+		case " $_extra " in
+			*" $_bip "*) continue ;;
+		esac
+		_extra="$_extra $_bip"
+	done
+	for _bip in $_extra; do
+		_elements="$_elements, $_bip"
+	done
+
+	_tmp="$NFT_FILE.tmp"
+	{
+		printf '# 由 sk5ctl 自动生成，请勿手工编辑\n'
+		printf 'table inet sk5 {\n'
+		printf '\tset bypass {\n'
+		printf '\t\ttype ipv4_addr\n'
+		printf '\t\tflags interval\n'
+		printf '\t\telements = { %s }\n' "$_elements"
+		printf '\t}\n'
+		printf '\tchain prerouting {\n'
+		printf '\t\ttype filter hook prerouting priority mangle; policy accept;\n'
+		printf '\t\tiifname != "%s" return\n' "$_lanif"
+		if [ "$(main_opt enforce_mac_ip 1)" != "0" ]; then
+			for _es in $(device_sections); do
+				[ "$(uci_get "$SK5_CONF.$_es.enabled")" = "0" ] && continue
+				_emac=$(uci_get "$SK5_CONF.$_es.mac")
+				_eip=$(uci_get "$SK5_CONF.$_es.ip")
+				[ -n "$_emac" ] && [ -n "$_eip" ] || continue
+				printf '\t\tether saddr %s ip saddr != %s ip saddr != 0.0.0.0 drop\n' "$_emac" "$_eip"
+			done
+		fi
+		printf '\t\tip daddr @bypass return\n'
+		printf '\t\tmeta mark 1 return\n'
+		printf '\t\tip protocol tcp tproxy to :%s meta mark set 1 accept\n' "$_tproxy"
+		printf '\t\tip protocol udp tproxy to :%s meta mark set 1 accept\n' "$_tproxy"
+		printf '\t}\n'
+		printf '}\n'
+	} > "$_tmp"
+	mv -f "$_tmp" "$NFT_FILE"
+	chmod 0644 "$NFT_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# 静态租约同步: device 段 -> /etc/config/dhcp 的 host 段
+# ------------------------------------------------------------------------------
+sync_dhcp() {
+	for _ss in $(device_sections); do
+		_smac=$(uci_get "$SK5_CONF.$_ss.mac")
+		_sip=$(uci_get "$SK5_CONF.$_ss.ip")
+		_snm=$(uci_get "$SK5_CONF.$_ss.name")
+		_sh="sk5_$_ss"
+		if [ -n "$_smac" ] && [ -n "$_sip" ]; then
+			[ -n "$(uci -q show "dhcp.$_sh" 2>/dev/null)" ] || uci set "dhcp.$_sh=host"
+			uci set "dhcp.$_sh.name=$_snm"
+			uci set "dhcp.$_sh.mac=$_smac"
+			uci set "dhcp.$_sh.ip=$_sip"
+			uci set "dhcp.$_sh.leasetime=12h"
+		else
+			uci -q delete "dhcp.$_sh"
+		fi
+	done
+
+	for _hh in $(uci -q show dhcp 2>/dev/null | sed -n 's/^dhcp\.\(sk5_[^.=]*\)=host$/\1/p'); do
+		_hm="${_hh#sk5_}"
+		[ -n "$(uci -q show "$SK5_CONF.$_hm" 2>/dev/null)" ] || uci -q delete "dhcp.$_hh"
+	done
+
+	uci -q commit dhcp
+	[ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq reload >/dev/null 2>&1
+	return 0
+}
+
+tproxy_up() {
+	[ -f "$NFT_FILE" ] || return 0
+	command -v nft >/dev/null 2>&1 || { log "未安装 nftables"; return 1; }
+	sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+	ip rule add fwmark 1 lookup 100 2>/dev/null
+	ip route add local 0.0.0.0/0 dev lo table 100 2>/dev/null
+	nft delete table inet sk5 2>/dev/null
+	nft -f "$NFT_FILE" || { log "加载 TPROXY 规则失败: $NFT_FILE"; return 1; }
+	return 0
+}
+
+tproxy_down() {
+	command -v nft >/dev/null 2>&1 && nft delete table inet sk5 2>/dev/null
+	ip rule del fwmark 1 lookup 100 2>/dev/null
+	ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
+	return 0
+}
+
+apply_all() {
+	sync_dhcp
+	gen_config
+	gen_nft
+
+	if [ "$(count_enabled_proxies)" -gt 0 ] && [ -x /etc/init.d/sk5 ]; then
+		/etc/init.d/sk5 restart >/dev/null 2>&1
+	elif [ -x /etc/init.d/sk5 ]; then
+		/etc/init.d/sk5 stop >/dev/null 2>&1
+		tproxy_down
+	fi
+	return 0
+}
+
+# ------------------------------------------------------------------------------
+# 首次开机初始化
+# ------------------------------------------------------------------------------
+cmd_defaults() {
+	_wkey=$(uci_get "$SK5_CONF.wifi.key")
+	if [ -z "$_wkey" ]; then
+		_wkey=$(gen_key)
+		uci set "$SK5_CONF.wifi.key=$_wkey"
+	fi
+	[ -n "$(uci_get "$SK5_CONF.wifi.ssid")" ] || uci set "$SK5_CONF.wifi.ssid=SK5-WiFi"
+
+	_start=$(uci_get dhcp.lan.start)
+	case "$_start" in ''|*[!0-9]*) _start=0 ;; esac
+	[ "$_start" -lt 100 ] && uci set dhcp.lan.start='100'
+	[ -n "$(uci_get dhcp.lan.limit)" ] || uci set dhcp.lan.limit='100'
+
+	if [ "$(main_opt disable_ipv6 1)" != "0" ]; then
+		uci set network.lan.ipv6='0'
+		uci set dhcp.lan.dhcpv6='disabled'
+		uci set dhcp.lan.ra='disabled'
+		uci set dhcp.lan.ndp='disabled'
+	else
+		uci set network.lan.ipv6='1'
+		uci set dhcp.lan.dhcpv6='server'
+		uci set dhcp.lan.ra='server'
+		uci set dhcp.lan.ndp='disabled'
+	fi
+
+	uci -q commit "$SK5_CONF"
+	uci -q commit dhcp
+	uci -q commit network
+	return 0
+}
+
+# 为检测到的每张无线网卡生成 AP（桥接到 lan）
+cmd_ap() {
+	if [ "$(wifi_opt disabled 0)" = "1" ]; then
+		log "无线已在 $SK5_CONF 中关闭，跳过 AP 配置"
+		return 0
+	fi
+	if [ ! -d /sys/class/ieee80211 ]; then
+		log "未检测到无线网卡，跳过 AP 配置（插卡后可执行 sk5ctl ap）"
+		return 0
+	fi
+	if command -v wifi >/dev/null 2>&1; then
+		wifi config >/dev/null 2>&1
+	fi
+
+	_ssid=$(wifi_opt ssid "SK5-WiFi")
+	_key=$(uci_get "$SK5_CONF.wifi.key")
+	if [ -z "$_key" ]; then
+		_key=$(gen_key)
+		uci set "$SK5_CONF.wifi.key=$_key"
+		uci -q commit "$SK5_CONF"
+	fi
+	_country=$(wifi_opt country "CN")
+
+	_radios=$(uci -q show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p')
+	if [ -z "$_radios" ]; then
+		log "无线配置里没有 radio，跳过 AP 配置"
+		return 0
+	fi
+
+	for _r in $_radios; do
+		uci set "wireless.$_r.disabled=0"
+		uci set "wireless.$_r.country=$_country"
+		uci set "wireless.$_r.channel=auto"
+		_if="sk5_$_r"
+		uci -q delete "wireless.$_if"
+		uci set "wireless.$_if=wifi-iface"
+		uci set "wireless.$_if.device=$_r"
+		uci set "wireless.$_if.mode=ap"
+		uci set "wireless.$_if.ssid=$_ssid"
+		uci set "wireless.$_if.encryption=psk2"
+		uci set "wireless.$_if.key=$_key"
+		uci set "wireless.$_if.network=lan"
+		uci set "wireless.$_if.disabled=0"
+		uci set "wireless.$_if.isolate=0"
+	done
+	uci -q commit wireless
+	command -v wifi >/dev/null 2>&1 && wifi reload >/dev/null 2>&1
+	log "已为 $_radios 配置 AP: SSID=$_ssid"
+	return 0
+}
+
+# ------------------------------------------------------------------------------
+# 用户命令
+# ------------------------------------------------------------------------------
+cmd_add() {
+	_name="$1"; _proxy="$2"; _mac="$3"; _ip="$4"
+	[ -n "$_name" ] && [ -n "$_proxy" ] || die "用法: sk5ctl add <名称> <socks5地址> [MAC] [IP]"
+	validate_name "$_name"
+	if find_section "$_name" >/dev/null; then
+		die "设备名称已存在: $_name"
+	fi
+	parse_proxy "$_proxy"
+
+	[ -n "$_mac" ] && _mac=$(normalize_mac "$_mac")
+	[ -n "$_mac" ] && check_mac_free "$_mac"
+
+	if [ -z "$_ip" ]; then
+		_ip=$(alloc_ip)
+		[ -n "$_ip" ] || die "静态地址池 (.10-.99) 已用尽"
+	else
+		validate_ip "$_ip"
+		check_ip_free "$_ip"
+	fi
+
+	_s="dev_$(printf '%s' "$_name" | md5sum | cut -c1-8)"
+	if [ -n "$(uci -q show "$SK5_CONF.$_s" 2>/dev/null)" ]; then
+		die "内部段名冲突，请换一个设备名称"
+	fi
+
+	uci set "$SK5_CONF.$_s=device"
+	uci set "$SK5_CONF.$_s.name=$_name"
+	uci set "$SK5_CONF.$_s.ip=$_ip"
+	uci set "$SK5_CONF.$_s.proxy=$_proxy"
+	uci set "$SK5_CONF.$_s.enabled=1"
+	[ -n "$_mac" ] && uci set "$SK5_CONF.$_s.mac=$_mac"
+	uci -q commit "$SK5_CONF"
+
+	apply_all
+	log "已添加设备: $_name  内网IP=$_ip  SK5=$P_HOST:$P_PORT"
+	return 0
+}
+
+cmd_set() {
+	_name="$1"; _field="$2"; shift 2
+	_value="$*"
+	_s=$(find_section "$_name") || die "找不到设备: $_name"
+
+	case "$_field" in
+		name)
+			validate_name "$_value"
+			for _x in $(device_sections); do
+				[ "$_x" = "$_s" ] && continue
+				[ "$(uci_get "$SK5_CONF.$_x.name")" = "$_value" ] && die "名称已被占用: $_value"
+			done
+			;;
+		mac)
+			_value=$(normalize_mac "$_value")
+			check_mac_free "$_value" "$_s"
+			;;
+		ip)
+			validate_ip "$_value"
+			check_ip_free "$_value" "$_s"
+			;;
+		proxy)
+			[ -n "$_value" ] && parse_proxy "$_value"
+			;;
+		enabled)
+			case "$_value" in 0|1) ;; *) die "enabled 只能是 0 或 1" ;; esac
+			;;
+		*)
+			die "可设置字段: name | mac | ip | proxy | enabled"
+			;;
+	esac
+
+	uci set "$SK5_CONF.$_s.$_field=$_value"
+	uci -q commit "$SK5_CONF"
+	apply_all
+	log "已更新: $_name.$_field = $_value"
+	return 0
+}
+
+cmd_del() {
+	_name="$1"
+	[ -n "$_name" ] || die "用法: sk5ctl del <名称>"
+	_s=$(find_section "$_name") || die "找不到设备: $_name"
+	uci -q delete "$SK5_CONF.$_s"
+	uci -q delete "dhcp.sk5_$_s"
+	uci -q commit "$SK5_CONF"
+	apply_all
+	log "已删除设备: $_name"
+	return 0
+}
+
+cmd_list() {
+	_n=$(count_enabled_proxies)
+	printf '%-14s %-18s %-16s %-8s %s\n' "名称" "MAC" "内网IP" "状态" "SK5 出口"
+	for _s in $(device_sections); do
+		_lname=$(uci_get "$SK5_CONF.$_s.name")
+		_lmac=$(uci_get "$SK5_CONF.$_s.mac")
+		_lip=$(uci_get "$SK5_CONF.$_s.ip")
+		_len=$(uci_get "$SK5_CONF.$_s.enabled")
+		_lproxy=$(uci_get "$SK5_CONF.$_s.proxy")
+		_st="启用"
+		[ "$_len" = "0" ] && _st="停用"
+		if [ -n "$_lproxy" ] && parse_proxy_raw "$_lproxy" 2>/dev/null; then
+			_eg="$P_HOST:$P_PORT"
+		else
+			_eg="(未配置)"
+		fi
+		printf '%-14s %-18s %-16s %-8s %s\n' "$_lname" "${_lmac:--}" "${_lip:--}" "$_st" "$_eg"
+	done
+	[ "$_n" -eq 0 ] && printf '\n提示: 还没有任何设备绑定 SK5，先执行 sk5ctl add <名称> socks5://user:pass@host:port <MAC>\n'
+	return 0
+}
+
+cmd_status() {
+	_svc="未运行"
+	pidof mihomo >/dev/null 2>&1 && _svc="运行中"
+	_ssid=$(wifi_opt ssid "SK5-WiFi")
+	_key=$(uci_get "$SK5_CONF.wifi.key")
+	_lan=$(uci_get network.lan.ipaddr)
+	_n=$(count_enabled_proxies)
+
+	printf '服务状态 : %s\n' "$_svc"
+	printf '设备数量 : %s 台已绑定 SK5\n' "$_n"
+	printf 'LAN 地址 : %s\n' "${_lan:-未知}"
+	printf 'WiFi     : SSID=%s  密码=%s\n' "$_ssid" "${_key:-未生成}"
+	printf '透明代理 : 端口 %s / 混合代理端口 %s\n' "$(main_opt tproxy_port 7895)" "$(main_opt mixed_port 7890)"
+	printf '管理地址 : http://%s/  (LuCI)\n' "${_lan:-192.168.1.1}"
+
+	_wdev=$(iw dev 2>/dev/null | sed -n 's/^[[:space:]]*Interface \([^ ]*\)$/\1/p' | tr '\n' ' ')
+	printf '无线接口 : %s\n' "${_wdev:-未检测到}"
+	return 0
+}
+
+cmd_wifi() {
+	printf 'SSID : %s\n' "$(wifi_opt ssid "SK5-WiFi")"
+	printf '密码 : %s\n' "$(uci_get "$SK5_CONF.wifi.key")"
+	printf '国家 : %s\n' "$(wifi_opt country "CN")"
+	iw dev 2>/dev/null | sed -n 's/^[[:space:]]*Interface \([^ ]*\)$/无线接口: \1/p'
+	return 0
+}
+
+usage() {
+	cat <<'EOF'
+sk5ctl - 单设备单 IP / 每设备独立 SK5 出口
+
+用法:
+  sk5ctl status                          查看服务、无线、设备概况
+  sk5ctl list                            列出已登记设备
+  sk5ctl add <名称> <socks5地址> [MAC] [IP]
+                                         登记设备（IP 省略时自动分配 .10-.99）
+  sk5ctl set <名称> <字段> <值>          字段: name|mac|ip|proxy|enabled
+  sk5ctl del <名称>                      删除设备
+  sk5ctl apply                           重新生成配置并重启代理
+  sk5ctl wifi                            查看 WiFi SSID / 密码
+  sk5ctl ap                              重新为无线网卡生成 AP 配置
+  sk5ctl tproxy up|down                  手动启停 TPROXY 规则
+
+示例:
+  sk5ctl add 手机01 socks5://user:pass@1.2.3.4:1080 AA:BB:CC:DD:EE:01
+  sk5ctl add 手机02 1.2.3.5:1080:user:pass
+  sk5ctl set 手机01 proxy socks5://user:pass@5.6.7.8:1080
+  sk5ctl set 手机01 enabled 0
+  sk5ctl del 手机02
+
+说明:
+  - 每台设备固定一个内网 IP，并独占一条 SK5 出口（一机一 IP）
+  - 透明代理按源 IP 分流，设备无需任何代理设置
+  - 未登记设备默认直连（可在 /etc/config/sk5 里把 default_action 改成 block）
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# 入口
+# ------------------------------------------------------------------------------
+case "$1" in
+	status)   cmd_status ;;
+	list|ls)  cmd_list ;;
+	add)      shift; cmd_add "$@" ;;
+	set)      shift; cmd_set "$@" ;;
+	del|remove|rm) shift; cmd_del "$@" ;;
+	apply)    apply_all; log "配置已重新生成并应用" ;;
+	generate) gen_config ;;
+	count)    count_enabled_proxies; printf '\n' ;;
+	defaults) cmd_defaults ;;
+	ap)       cmd_ap ;;
+	wifi)     cmd_wifi ;;
+	tproxy)
+		case "$2" in
+			up) tproxy_up ;;
+			down) tproxy_down ;;
+			*) die "用法: sk5ctl tproxy up|down" ;;
+		esac
+		;;
+	help|-h|--help|'') usage ;;
+	*) usage; exit 1 ;;
+esac

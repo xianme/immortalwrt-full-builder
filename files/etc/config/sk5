@@ -1,0 +1,29 @@
+# ==============================================================================
+# SK5 出口 / 单设备单 IP 主配置
+# 由 LuCI 之外的命令行工具 /usr/sbin/sk5ctl 读写，手工修改后请执行 sk5ctl apply
+# ==============================================================================
+
+config sk5 'main'
+	option enabled '1'
+	# 透明代理入口端口 (nftables TPROXY 目标端口，mihomo tproxy-port)
+	option tproxy_port '7895'
+	# 局域网内可直接使用的混合代理端口 (http/socks5)
+	option mixed_port '7890'
+	# mihomo 控制接口，仅监听 127.0.0.1
+	option api_port '9090'
+	option log_level 'warning'
+	# 透明代理接管的入站接口，留空则自动取 network.lan.device（通常是 br-lan）
+	option lan_if ''
+	# 未登记设备的上网策略: direct = 直连, block = 拒绝
+	option default_action 'direct'
+	# 强制 MAC 与 IP 绑定，防止设备自行改 IP 绕过出口策略
+	option enforce_mac_ip '1'
+	# 关闭 IPv6 下发，避免设备用 IPv6 绕过 SK5 泄漏真实地址
+	option disable_ipv6 '1'
+
+config wifi 'wifi'
+	option ssid 'SK5-WiFi'
+	# 首次开机由 sk5ctl defaults 生成随机密码；也可手工改成自己的密码
+	option key ''
+	option country 'CN'
+	option disabled '0'
