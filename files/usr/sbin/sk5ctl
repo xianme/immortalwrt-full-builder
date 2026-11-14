@@ -176,6 +176,8 @@ check_mac_free() {
 alloc_ip() {
 	_lan=$(uci_get network.lan.ipaddr)
 	[ -n "$_lan" ] || _lan="192.168.1.1"
+	# 兼容 CIDR 写法 (192.168.1.1/24) 与纯 IP 写法
+	_lan="${_lan%%/*}"
 	case "$_lan" in
 		*.*.*.*) ;;
 		*) die "无法识别 LAN 地址: $_lan" ;;
@@ -638,6 +640,7 @@ cmd_status() {
 	_ssid=$(wifi_opt ssid "SK5-WiFi")
 	_key=$(uci_get "$SK5_CONF.wifi.key")
 	_lan=$(uci_get network.lan.ipaddr)
+	_lan_host="${_lan%%/*}"
 	_n=$(count_enabled_proxies)
 
 	printf '服务状态 : %s\n' "$_svc"
@@ -645,10 +648,14 @@ cmd_status() {
 	printf 'LAN 地址 : %s\n' "${_lan:-未知}"
 	printf 'WiFi     : SSID=%s  密码=%s\n' "$_ssid" "${_key:-未生成}"
 	printf '透明代理 : 端口 %s / 混合代理端口 %s\n' "$(main_opt tproxy_port 7895)" "$(main_opt mixed_port 7890)"
-	printf '管理地址 : http://%s/  (LuCI)\n' "${_lan:-192.168.1.1}"
+	printf '管理地址 : http://%s/  (LuCI)\n' "${_lan_host:-192.168.1.1}"
 
-	_wdev=$(iw dev 2>/dev/null | sed -n 's/^[[:space:]]*Interface \([^ ]*\)$/\1/p' | tr '\n' ' ')
-	printf '无线接口 : %s\n' "${_wdev:-未检测到}"
+	if command -v iw >/dev/null 2>&1; then
+		_wdev=$(iw dev 2>/dev/null | sed -n 's/^[[:space:]]*Interface \([^ ]*\)$/\1/p' | tr '\n' ' ')
+		printf '无线接口 : %s\n' "${_wdev:-未检测到}"
+	else
+		printf '无线接口 : iw 工具缺失\n'
+	fi
 	return 0
 }
 
